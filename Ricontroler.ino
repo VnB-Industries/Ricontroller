@@ -3,24 +3,31 @@
 // Command format: DISPENSE:<pump1_volume_cL>:<pump2_volume_cL> e.g. "DISPENSE:2:20"
 // Also supports: STOP  (aborts an in-progress dispense)
 //
-// RFID: Grove NFC shield (PN532, I2C).  Install "Adafruit PN532" from the
-//       Arduino Library Manager.  RESET wired to pin 3; no IRQ needed.
+// RFID: Grove NFC shield (PN532, SPI default wiring). Install "Adafruit PN532"
+//       from Arduino Library Manager. CS/SS on D10 by default.
 //
 // Sensor: YF-S401, calibration factor 5880 pulses/liter
 // Pump1: driven through relay/MOSFET on pin 7 (flow sensor backed)
 // Pump2: driven through relay/MOSFET on pin 6 (time estimation only)
 
-#include <Wire.h>
+#include <SPI.h>
 #include <Adafruit_PN532.h>
 
-// PN532 in I2C polling mode (no IRQ pin), RESET on pin 3
-#define PN532_IRQ_PIN    255
-#define PN532_RESET_PIN  3
-Adafruit_PN532 nfc(PN532_IRQ_PIN, PN532_RESET_PIN);
+#if defined(__AVR__)
+#include <avr/io.h>
+#include <avr/wdt.h>
+#endif
+
+// PN532 in hardware SPI mode. Grove shield defaults CS/SS to D10.
+#define PN532_SS_PIN  10
+Adafruit_PN532 nfc(PN532_SS_PIN);
 
 const int hallsensor = 2;      // Flow sensor signal pin (interrupt-capable: 2 or 3 on Uno)
 const int pump1Pin = 7;        // Relay/MOSFET control pin for pump1
 const int pump2Pin = 6;        // Relay/MOSFET control pin for pump2
+const int irSensorPin = 4;     // IR object detection sensor digital output
+
+const bool irDetectActiveLow = true; // true for common LM393 modules: LOW means object detected
 
 volatile unsigned long pulseCount = 0;
 
@@ -52,15 +59,111 @@ String inputBuffer = "";
 static char        s_lastUidHex[32]  = "";
 static unsigned long s_lastUidSentMs = 0;
 
+static bool nfcReady = false;
+static unsigned long s_lastNfcInitAttemptMs = 0;
+
+#if defined(__AVR__)
+static uint8_t s_resetFlags = 0;
+
+// Capture reset flags as early as possible, before runtime init may alter MCUSR.
+void captureResetFlags(void) __attribute__((naked)) __attribute__((section(".init3")));
+void captureResetFlags(void)
+{
+  s_resetFlags = MCUSR;
+  MCUSR = 0;
+  wdt_disable();
+}
+#endif
+
 void readSerialCommands();
 void handleCommand(String cmd);
 void startDispense(float pump1Centiliters, float pump2Centiliters);
 void stopDispense(const char* resultMsg);
 void pollRfid();
+bool isObjectDetected();
+void printResetCause();
+void tryInitNfc(bool force);
 
 void rpm()
 {
   pulseCount++;
+}
+
+bool isObjectDetected()
+{
+  int raw = digitalRead(irSensorPin);
+  return irDetectActiveLow ? (raw == LOW) : (raw == HIGH);
+}
+
+void printResetCause()
+{
+#if defined(__AVR__)
+  Serial.print("RESET_CAUSE:");
+  bool any = false;
+
+  if (s_resetFlags & _BV(PORF))
+  {
+    Serial.print("POR");
+    any = true;
+  }
+  if (s_resetFlags & _BV(EXTRF))
+  {
+    if (any) Serial.print("|");
+    Serial.print("EXT");
+    any = true;
+  }
+  if (s_resetFlags & _BV(BORF))
+  {
+    if (any) Serial.print("|");
+    Serial.print("BOR");
+    any = true;
+  }
+  if (s_resetFlags & _BV(WDRF))
+  {
+    if (any) Serial.print("|");
+    Serial.print("WDT");
+    any = true;
+  }
+
+  if (!any)
+  {
+    Serial.print("UNKNOWN");
+  }
+
+  Serial.print(":0x");
+  Serial.println(s_resetFlags, HEX);
+#else
+  Serial.println("RESET_CAUSE:UNSUPPORTED");
+#endif
+}
+
+void tryInitNfc(bool force)
+{
+  unsigned long nowMs = millis();
+  if (!force && (nowMs - s_lastNfcInitAttemptMs < 2000UL))
+  {
+    return;
+  }
+
+  s_lastNfcInitAttemptMs = nowMs;
+
+  if (nfc.getFirmwareVersion())
+  {
+    nfc.SAMConfig();
+    if (!nfcReady)
+    {
+      Serial.println("NFC:READY");
+    }
+    nfcReady = true;
+  }
+  else
+  {
+    if (force || nfcReady)
+    {
+      Serial.println("NFC:NO_SHIELD");
+    }
+    nfcReady = false;
+  }
 }
 
 bool parseNonNegativeFloat(const String& text, float* outValue)
@@ -151,6 +254,7 @@ void setup()
   pinMode(hallsensor, INPUT_PULLUP);
   pinMode(pump1Pin, OUTPUT);
   pinMode(pump2Pin, OUTPUT);
+  pinMode(irSensorPin, INPUT_PULLUP);
   digitalWrite(pump1Pin, LOW);   // Pump OFF at startup (assumes active-HIGH relay; invert if yours is active-LOW)
   digitalWrite(pump2Pin, LOW);
 
@@ -158,13 +262,9 @@ void setup()
   attachInterrupt(digitalPinToInterrupt(hallsensor), rpm, RISING);
 
   nfc.begin();
-  if (!nfc.getFirmwareVersion()) {
-    Serial.println("NFC:NO_SHIELD");
-    // Dispenser still works without RFID
-  } else {
-    nfc.SAMConfig();
-  }
+  tryInitNfc(true);
 
+  printResetCause();
   Serial.println("READY");
 }
 
@@ -174,6 +274,12 @@ void loop()
 
   if (dispensing)
   {
+    if (!isObjectDetected())
+    {
+      stopDispense("ERROR:NO_OBJECT");
+      return;
+    }
+
     unsigned long nowMs = millis();
 
     noInterrupts();
@@ -251,6 +357,12 @@ void handleCommand(String cmd)
     if (dispensing)
     {
       Serial.println("ERROR:BUSY");
+      return;
+    }
+
+    if (!isObjectDetected())
+    {
+      Serial.println("ERROR:NO_OBJECT");
       return;
     }
 
@@ -380,6 +492,13 @@ void stopDispense(const char* resultMsg)
 // does not interfere with pump control.
 void pollRfid()
 {
+  if (!nfcReady)
+  {
+    // Keep trying to recover PN532 after transient power/reset issues.
+    tryInitNfc(false);
+    return;
+  }
+
   uint8_t uid[7];
   uint8_t uidLen = 0;
 

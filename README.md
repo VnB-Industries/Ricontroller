@@ -19,14 +19,12 @@ Le controleur:
 ## Materiel et brochage
 
 - Capteur de debit YF-S401 (interruption): pin D2
-- Pompe 1 (relais/MOSFET): pin D7
-- Pompe 2 (relais/MOSFET): pin D6
-- RFID PN532 (Grove NFC shield, I2C):
-  - I2C via bus Arduino (`SDA`/`SCL`)
-  - reset sur pin D3
+- Relais NO Pompe 1: pin D7
+- Relais NO Pompe 2: pin D6
+- RFID PN532 (Grove NFC shield, SPI):
+  - CS/SS par defaut sur D10 (option D9 selon strap du shield)
+  - bus SPI via connecteur ICSP (MISO/MOSI/SCK)
   - IRQ non utilise (mode polling)
-
-- Relais actifs a l'etat HIGH (`HIGH = pompe ON`).
 
 ## Prerequis logiciels
 
@@ -77,7 +75,7 @@ Configuration port serie:
 - `RFID:<UID_HEX>`
   - UID RFID detecte en hex uppercase.
 - `NFC:NO_SHIELD`
-  - Shield PN532 non detecte au demarrage (le mode pompes reste fonctionnel).
+  - Shield PN532 non detecte (le mode pompes reste fonctionnel).
 
 ## RFID
 
@@ -123,7 +121,8 @@ echo 'STOP' > /dev/ttyACM0
   - verifier cable USB data (pas charge-only).
 - `NFC:NO_SHIELD`:
   - verifier alimentation du shield,
-  - verifier cablage I2C et pin reset D3,
+  - verifier cablage SPI et strap SS (D10 par defaut),
+  - verifier antenne sur bornier ANT1,
   - verifier la bibliotheque `Adafruit PN532`.
 - `ERROR:TIMEOUT` sur pompe 1:
   - verifier capteur de debit et cablage D2,

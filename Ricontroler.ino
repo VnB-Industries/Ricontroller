@@ -1,7 +1,10 @@
 // Arduino flow-controlled dispenser
 // Receives commands over USB serial from Raspberry Pi (or serial console for debug)
 // Command format: DISPENSE:<pump1_volume_cL>:<pump2_volume_cL> e.g. "DISPENSE:2:20"
-// Also supports: STOP  (aborts an in-progress dispense)
+// Also supports:
+//   STOP                           (aborts an in-progress dispense/calibration)
+//   CAL:<pump_index>:<quantity_cL> (start calibration mode for pump 1 or 2)
+//   SETFLOW:<p1_pulses_per_cL>:<p2_cL_per_s> (set runtime constants)
 //
 // RFID: Grove NFC shield (PN532, SPI default wiring). Install "Adafruit PN532"
 //       from Arduino Library Manager. CS/SS on D10 by default.
@@ -31,8 +34,20 @@ const bool irDetectActiveLow = true; // true for common LM393 modules: LOW means
 
 volatile unsigned long pulseCount = 0;
 
-const float pulsesPerCl = 540.42;
-const float pump2FlowClPerSec = 2.8;
+const float defaultPulsesPerCl = 540.42;
+const float defaultPump2FlowClPerSec = 2.8;
+
+float pulsesPerCl = defaultPulsesPerCl;
+float pump2FlowClPerSec = defaultPump2FlowClPerSec;
+
+enum RunMode
+{
+  RUN_MODE_IDLE = 0,
+  RUN_MODE_DISPENSE,
+  RUN_MODE_CALIBRATION
+};
+
+RunMode runMode = RUN_MODE_IDLE;
 
 bool dispensing = false;
 bool pump1Running = false;
@@ -49,6 +64,10 @@ unsigned long maxDispenseTime = 0;      // Safety timeout, calculated per dispen
 unsigned long pump2StartTime = 0;
 unsigned long pump2TargetDurationMs = 0;
 unsigned long lastProgressReport = 0;
+
+int calibrationPumpIndex = 0;            // 1 for pump1, 2 for pump2
+float calibrationTargetCl = 0.0;
+unsigned long calibrationStartTime = 0;
 
 const float expectedMinFlow_Lmin = 0.2; // Used only to size the safety timeout;
                                          // set below your pump's slowest expected flow
@@ -79,6 +98,10 @@ void readSerialCommands();
 void handleCommand(String cmd);
 void startDispense(float pump1Centiliters, float pump2Centiliters);
 void stopDispense(const char* resultMsg);
+void startCalibration(int pumpIndex, float targetCentiliters);
+void stopCalibration(const char* resultMsg, bool applyCalibration);
+void processCalibrationTick();
+void processDispenseTick();
 void pollRfid();
 bool isObjectDetected();
 void printResetCause();
@@ -216,11 +239,22 @@ bool parseNonNegativeFloat(const String& text, float* outValue)
 
 float getPump1MeasuredCl(unsigned long currentPulses)
 {
+  if (pulsesPerCl <= 0.0001)
+  {
+    return 0.0;
+  }
+
   return currentPulses / pulsesPerCl;
 }
 
 float getPump2EstimatedCl(unsigned long nowMs)
 {
+  if (runMode == RUN_MODE_CALIBRATION && calibrationPumpIndex == 2)
+  {
+    unsigned long elapsedCal = nowMs - calibrationStartTime;
+    return (elapsedCal / 1000.0) * pump2FlowClPerSec;
+  }
+
   if (requestedPump2Cl <= 0)
   {
     return 0.0;
@@ -274,52 +308,14 @@ void loop()
 
   if (dispensing)
   {
-    if (!isObjectDetected())
+    if (runMode == RUN_MODE_CALIBRATION)
     {
-      stopDispense("ERROR:NO_OBJECT");
+      processCalibrationTick();
       return;
     }
 
-    unsigned long nowMs = millis();
-
-    noInterrupts();
-    unsigned long currentPulses = pulseCount;
-    interrupts();
-
-    if (pump1Running)
-    {
-      if (currentPulses >= targetPulses)
-      {
-        digitalWrite(pump1Pin, LOW);
-        pump1Running = false;
-        pump1Done = true;
-      }
-      else if (nowMs - dispenseStartTime > maxDispenseTime)
-      {
-        stopDispense("ERROR:TIMEOUT");
-        return;
-      }
-    }
-
-    if (pump2Running && (nowMs - pump2StartTime >= pump2TargetDurationMs))
-    {
-      digitalWrite(pump2Pin, LOW);
-      pump2Running = false;
-      pump2Done = true;
-    }
-
-    if (pump1Done && pump2Done)
-    {
-      stopDispense("OK");
-    }
-    else
-    {
-      if (nowMs - lastProgressReport >= 250)
-      {
-        lastProgressReport = nowMs;
-        printProgress(currentPulses, nowMs);
-      }
-    }
+    processDispenseTick();
+    return;
   }
   else
   {
@@ -393,11 +389,83 @@ void handleCommand(String cmd)
 
     startDispense(pump1Cl, pump2Cl);
   }
+  else if (cmd.startsWith("CAL:"))
+  {
+    if (dispensing)
+    {
+      Serial.println("ERROR:BUSY");
+      return;
+    }
+
+    if (!isObjectDetected())
+    {
+      Serial.println("ERROR:NO_OBJECT");
+      return;
+    }
+
+    String payload = cmd.substring(4);
+    int sep = payload.indexOf(':');
+    if (sep < 0 || payload.indexOf(':', sep + 1) >= 0)
+    {
+      Serial.println("ERROR:INVALID_CALIBRATION");
+      return;
+    }
+
+    String pumpToken = payload.substring(0, sep);
+    String quantityToken = payload.substring(sep + 1);
+    pumpToken.trim();
+
+    int pumpIndex = pumpToken.toInt();
+    float quantityCl = 0.0;
+    if ((pumpIndex != 1 && pumpIndex != 2) || !parseNonNegativeFloat(quantityToken, &quantityCl) || quantityCl <= 0.0)
+    {
+      Serial.println("ERROR:INVALID_CALIBRATION");
+      return;
+    }
+
+    startCalibration(pumpIndex, quantityCl);
+  }
+  else if (cmd.startsWith("SETFLOW:"))
+  {
+    String payload = cmd.substring(8);
+    int sep = payload.indexOf(':');
+    if (sep < 0 || payload.indexOf(':', sep + 1) >= 0)
+    {
+      Serial.println("ERROR:INVALID_CONSTANTS");
+      return;
+    }
+
+    String p1Token = payload.substring(0, sep);
+    String p2Token = payload.substring(sep + 1);
+    float newP1 = 0.0;
+    float newP2 = 0.0;
+    if (!parseNonNegativeFloat(p1Token, &newP1) || !parseNonNegativeFloat(p2Token, &newP2)
+        || newP1 <= 0.0 || newP2 <= 0.0)
+    {
+      Serial.println("ERROR:INVALID_CONSTANTS");
+      return;
+    }
+
+    pulsesPerCl = newP1;
+    pump2FlowClPerSec = newP2;
+
+    Serial.print("SETFLOW:OK:");
+    Serial.print(pulsesPerCl, 3);
+    Serial.print(":");
+    Serial.println(pump2FlowClPerSec, 3);
+  }
   else if (cmd == "STOP")
   {
     if (dispensing)
     {
-      stopDispense("STOPPED");
+      if (runMode == RUN_MODE_CALIBRATION)
+      {
+        stopCalibration("CAL:STOPPED", false);
+      }
+      else
+      {
+        stopDispense("STOPPED");
+      }
     }
     else
     {
@@ -412,6 +480,7 @@ void handleCommand(String cmd)
 
 void startDispense(float pump1Centiliters, float pump2Centiliters)
 {
+  runMode = RUN_MODE_DISPENSE;
   requestedPump1Cl = pump1Centiliters;
   requestedPump2Cl = pump2Centiliters;
 
@@ -462,12 +531,54 @@ void startDispense(float pump1Centiliters, float pump2Centiliters)
   Serial.println(pump2Centiliters, 3);
 }
 
+void startCalibration(int pumpIndex, float targetCentiliters)
+{
+  runMode = RUN_MODE_CALIBRATION;
+  dispensing = true;
+  calibrationPumpIndex = pumpIndex;
+  calibrationTargetCl = targetCentiliters;
+  calibrationStartTime = millis();
+  lastProgressReport = calibrationStartTime;
+
+  requestedPump1Cl = 0.0;
+  requestedPump2Cl = 0.0;
+
+  noInterrupts();
+  pulseCount = 0;
+  interrupts();
+
+  digitalWrite(pump1Pin, LOW);
+  digitalWrite(pump2Pin, LOW);
+  pump1Running = false;
+  pump2Running = false;
+  pump1Done = false;
+  pump2Done = false;
+
+  if (pumpIndex == 1)
+  {
+    digitalWrite(pump1Pin, HIGH);
+    pump1Running = true;
+  }
+  else
+  {
+    digitalWrite(pump2Pin, HIGH);
+    pump2Running = true;
+    pump2StartTime = calibrationStartTime;
+  }
+
+  Serial.print("CAL:STARTED:");
+  Serial.print(pumpIndex);
+  Serial.print(":");
+  Serial.println(targetCentiliters, 3);
+}
+
 void stopDispense(const char* resultMsg)
 {
   unsigned long nowMs = millis();
   digitalWrite(pump1Pin, LOW);
   digitalWrite(pump2Pin, LOW);
   dispensing = false;
+  runMode = RUN_MODE_IDLE;
   pump1Running = false;
   pump2Running = false;
   pump1Done = true;
@@ -485,6 +596,135 @@ void stopDispense(const char* resultMsg)
   Serial.print(actualPump1Cl, 3);
   Serial.print(":");
   Serial.println(estimatedPump2Cl, 3);
+}
+
+void stopCalibration(const char* resultMsg, bool applyCalibration)
+{
+  unsigned long nowMs = millis();
+  digitalWrite(pump1Pin, LOW);
+  digitalWrite(pump2Pin, LOW);
+
+  dispensing = false;
+  runMode = RUN_MODE_IDLE;
+  pump1Running = false;
+  pump2Running = false;
+  pump1Done = true;
+  pump2Done = true;
+
+  noInterrupts();
+  unsigned long currentPulses = pulseCount;
+  interrupts();
+
+  unsigned long elapsedMs = nowMs - calibrationStartTime;
+  float elapsedSec = elapsedMs / 1000.0;
+
+  float newPump1 = pulsesPerCl;
+  float newPump2 = pump2FlowClPerSec;
+
+  if (applyCalibration)
+  {
+    if (calibrationPumpIndex == 1)
+    {
+      if (calibrationTargetCl > 0.0 && currentPulses > 0)
+      {
+        newPump1 = currentPulses / calibrationTargetCl;
+      }
+    }
+    else if (calibrationPumpIndex == 2)
+    {
+      if (calibrationTargetCl > 0.0 && elapsedSec > 0.05)
+      {
+        newPump2 = calibrationTargetCl / elapsedSec;
+      }
+    }
+
+    if (newPump1 > 0.0)
+    {
+      pulsesPerCl = newPump1;
+    }
+    if (newPump2 > 0.0)
+    {
+      pump2FlowClPerSec = newPump2;
+    }
+  }
+
+  Serial.print(resultMsg);
+  Serial.print(":");
+  Serial.print(pulsesPerCl, 3);
+  Serial.print(":");
+  Serial.println(pump2FlowClPerSec, 3);
+
+  calibrationPumpIndex = 0;
+  calibrationTargetCl = 0.0;
+  calibrationStartTime = 0;
+}
+
+void processDispenseTick()
+{
+  if (!isObjectDetected())
+  {
+    stopDispense("ERROR:NO_OBJECT");
+    return;
+  }
+
+  unsigned long nowMs = millis();
+
+  noInterrupts();
+  unsigned long currentPulses = pulseCount;
+  interrupts();
+
+  if (pump1Running)
+  {
+    if (currentPulses >= targetPulses)
+    {
+      digitalWrite(pump1Pin, LOW);
+      pump1Running = false;
+      pump1Done = true;
+    }
+    else if (nowMs - dispenseStartTime > maxDispenseTime)
+    {
+      stopDispense("ERROR:TIMEOUT");
+      return;
+    }
+  }
+
+  if (pump2Running && (nowMs - pump2StartTime >= pump2TargetDurationMs))
+  {
+    digitalWrite(pump2Pin, LOW);
+    pump2Running = false;
+    pump2Done = true;
+  }
+
+  if (pump1Done && pump2Done)
+  {
+    stopDispense("OK");
+  }
+  else if (nowMs - lastProgressReport >= 250)
+  {
+    lastProgressReport = nowMs;
+    printProgress(currentPulses, nowMs);
+  }
+}
+
+void processCalibrationTick()
+{
+  unsigned long nowMs = millis();
+
+  noInterrupts();
+  unsigned long currentPulses = pulseCount;
+  interrupts();
+
+  if (!isObjectDetected())
+  {
+    stopCalibration("CAL:STOPPED_BY_SENSOR", true);
+    return;
+  }
+
+  if (nowMs - lastProgressReport >= 250)
+  {
+    lastProgressReport = nowMs;
+    printProgress(currentPulses, nowMs);
+  }
 }
 
 // Poll for an RFID tag and send "RFID:<hex_uid>" when one is found.

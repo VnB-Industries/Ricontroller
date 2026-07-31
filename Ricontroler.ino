@@ -1,10 +1,11 @@
 // Arduino flow-controlled dispenser
 // Receives commands over USB serial from Raspberry Pi (or serial console for debug)
-// Command format: DISPENSE:<pump1_volume_cL>:<pump2_volume_cL> e.g. "DISPENSE:2:20"
+// Command format: DISPENSE:<pump1_cL>:<pump2_cL>[:<pump3_cL>...] e.g. "DISPENSE:2:20"
+//   Pump 1 (index 0) has a flow meter; pumps 2..N are time-based.
 // Also supports:
 //   STOP                           (aborts an in-progress dispense/calibration)
-//   CAL:<pump_index>:<quantity_cL> (start calibration mode for pump 1 or 2)
-//   SETFLOW:<p1_pulses_per_cL>:<p2_cL_per_s> (set runtime constants)
+//   CAL:<pump_index>:<quantity_cL> (calibrate pump 1..N; pump 1 uses pulses, others time)
+//   SETFLOW:<p1_pulses_per_cL>:<p2_cL_per_s>[:<p3_cL_per_s>...] (set runtime constants)
 //
 // RFID: Grove NFC shield (PN532, SPI default wiring). Install "Adafruit PN532"
 //       from Arduino Library Manager. CS/SS on D10 by default.
@@ -26,9 +27,12 @@
 Adafruit_PN532 nfc(PN532_SS_PIN);
 
 const int hallsensor = 2;      // Flow sensor signal pin (interrupt-capable: 2 or 3 on Uno)
-const int pump1Pin = 7;        // Relay/MOSFET control pin for pump1
-const int pump2Pin = 6;        // Relay/MOSFET control pin for pump2
 const int irSensorPin = 4;     // IR object detection sensor digital output
+
+// Pump 1 (index 0) is the flow-meter pump; pumps 2..N are time-based.
+// Pins avoid 2 (flow interrupt), 4 (IR) and 10-13 (SPI/PN532).
+#define MAX_PUMPS 6
+const int pumpPins[MAX_PUMPS] = { 7, 6, 5, 8, 9, 3 };
 
 const bool irDetectActiveLow = true; // true for common LM393 modules: LOW means object detected
 
@@ -37,8 +41,8 @@ volatile unsigned long pulseCount = 0;
 const float defaultPulsesPerCl = 540.42;
 const float defaultPump2FlowClPerSec = 2.8;
 
-float pulsesPerCl = defaultPulsesPerCl;
-float pump2FlowClPerSec = defaultPump2FlowClPerSec;
+float pulsesPerCl = defaultPulsesPerCl;            // pump 1 flow-meter constant (pulses/cL)
+float timeFlowClPerSec[MAX_PUMPS];                 // time-based pumps (cL/s); index 0 unused
 
 enum RunMode
 {
@@ -50,22 +54,20 @@ enum RunMode
 RunMode runMode = RUN_MODE_IDLE;
 
 bool dispensing = false;
-bool pump1Running = false;
-bool pump2Running = false;
-bool pump1Done = false;
-bool pump2Done = false;
+int  activePumpCount = 0;
 
-float requestedPump1Cl = 0.0;
-float requestedPump2Cl = 0.0;
+bool  pumpRunning[MAX_PUMPS];
+bool  pumpDone[MAX_PUMPS];
+float requestedCl[MAX_PUMPS];
+unsigned long pumpStartTime[MAX_PUMPS];
+unsigned long pumpTargetDurationMs[MAX_PUMPS];
 
-unsigned long targetPulses = 0;
+unsigned long targetPulses = 0;         // pump 1 flow-meter target
 unsigned long dispenseStartTime = 0;
 unsigned long maxDispenseTime = 0;      // Safety timeout, calculated per dispense
-unsigned long pump2StartTime = 0;
-unsigned long pump2TargetDurationMs = 0;
 unsigned long lastProgressReport = 0;
 
-int calibrationPumpIndex = 0;            // 1 for pump1, 2 for pump2
+int calibrationPumpIndex = 0;           // 1-based pump number under calibration
 float calibrationTargetCl = 0.0;
 unsigned long calibrationStartTime = 0;
 
@@ -96,7 +98,7 @@ void captureResetFlags(void)
 
 void readSerialCommands();
 void handleCommand(String cmd);
-void startDispense(float pump1Centiliters, float pump2Centiliters);
+void startDispense(float* volumesCentiliters, int count);
 void stopDispense(const char* resultMsg);
 void startCalibration(int pumpIndex, float targetCentiliters);
 void stopCalibration(const char* resultMsg, bool applyCalibration);
@@ -237,6 +239,44 @@ bool parseNonNegativeFloat(const String& text, float* outValue)
   return true;
 }
 
+// Split a colon-separated list of non-negative floats into out[]. Returns the
+// number parsed, or -1 on any invalid/empty token or if there are more than maxOut.
+int splitFloats(const String& payload, float* out, int maxOut, bool requirePositive)
+{
+  int start = 0;
+  int count = 0;
+
+  while (true)
+  {
+    int sep = payload.indexOf(':', start);
+    String token = (sep < 0) ? payload.substring(start) : payload.substring(start, sep);
+
+    float value = 0.0;
+    if (!parseNonNegativeFloat(token, &value))
+    {
+      return -1;
+    }
+    if (requirePositive && value <= 0.0)
+    {
+      return -1;
+    }
+    if (count >= maxOut)
+    {
+      return -1;
+    }
+
+    out[count++] = value;
+
+    if (sep < 0)
+    {
+      break;
+    }
+    start = sep + 1;
+  }
+
+  return count;
+}
+
 float getPump1MeasuredCl(unsigned long currentPulses)
 {
   if (pulsesPerCl <= 0.0001)
@@ -247,29 +287,30 @@ float getPump1MeasuredCl(unsigned long currentPulses)
   return currentPulses / pulsesPerCl;
 }
 
-float getPump2EstimatedCl(unsigned long nowMs)
+// Time-based estimate for a non-flow-meter pump (0-based index >= 1).
+float getPumpTimeEstimateCl(int idx, unsigned long nowMs)
 {
-  if (runMode == RUN_MODE_CALIBRATION && calibrationPumpIndex == 2)
-  {
-    unsigned long elapsedCal = nowMs - calibrationStartTime;
-    return (elapsedCal / 1000.0) * pump2FlowClPerSec;
-  }
-
-  if (requestedPump2Cl <= 0)
+  if (idx < 1 || idx >= MAX_PUMPS)
   {
     return 0.0;
   }
 
-  unsigned long elapsed = nowMs - pump2StartTime;
-  if (elapsed > pump2TargetDurationMs)
+  float flow = timeFlowClPerSec[idx];
+  if (requestedCl[idx] <= 0 || flow <= 0.0001)
   {
-    elapsed = pump2TargetDurationMs;
+    return 0.0;
   }
 
-  float estimated = (elapsed / 1000.0) * pump2FlowClPerSec;
-  if (estimated > requestedPump2Cl)
+  unsigned long elapsed = nowMs - pumpStartTime[idx];
+  if (elapsed > pumpTargetDurationMs[idx])
   {
-    estimated = requestedPump2Cl;
+    elapsed = pumpTargetDurationMs[idx];
+  }
+
+  float estimated = (elapsed / 1000.0) * flow;
+  if (estimated > requestedCl[idx])
+  {
+    estimated = requestedCl[idx];
   }
 
   return estimated;
@@ -278,19 +319,35 @@ float getPump2EstimatedCl(unsigned long nowMs)
 void printProgress(unsigned long currentPulses, unsigned long nowMs)
 {
   Serial.print("PROGRESS:");
-  Serial.print(getPump1MeasuredCl(currentPulses), 3);
-  Serial.print(":");
-  Serial.println(getPump2EstimatedCl(nowMs), 3);
+  for (int i = 0; i < activePumpCount; i++)
+  {
+    if (i > 0)
+    {
+      Serial.print(":");
+    }
+    float value = (i == 0) ? getPump1MeasuredCl(currentPulses)
+                           : getPumpTimeEstimateCl(i, nowMs);
+    Serial.print(value, 3);
+  }
+  Serial.println();
 }
 
 void setup()
 {
   pinMode(hallsensor, INPUT_PULLUP);
-  pinMode(pump1Pin, OUTPUT);
-  pinMode(pump2Pin, OUTPUT);
   pinMode(irSensorPin, INPUT_PULLUP);
-  digitalWrite(pump1Pin, LOW);   // Pump OFF at startup (assumes active-HIGH relay; invert if yours is active-LOW)
-  digitalWrite(pump2Pin, LOW);
+
+  for (int i = 0; i < MAX_PUMPS; i++)
+  {
+    pinMode(pumpPins[i], OUTPUT);
+    digitalWrite(pumpPins[i], LOW);   // Pumps OFF at startup (active-HIGH relay; invert if active-LOW)
+    timeFlowClPerSec[i] = defaultPump2FlowClPerSec;
+    pumpRunning[i] = false;
+    pumpDone[i] = false;
+    requestedCl[i] = 0.0;
+    pumpStartTime[i] = 0;
+    pumpTargetDurationMs[i] = 0;
+  }
 
   Serial.begin(9600);
   attachInterrupt(digitalPinToInterrupt(hallsensor), rpm, RISING);
@@ -363,31 +420,29 @@ void handleCommand(String cmd)
     }
 
     String payload = cmd.substring(9);
-    int sep = payload.indexOf(':');
-    if (sep < 0 || payload.indexOf(':', sep + 1) >= 0)
+    float vols[MAX_PUMPS];
+    int count = splitFloats(payload, vols, MAX_PUMPS, false);
+    if (count < 1)
     {
       Serial.println("ERROR:INVALID_VOLUME");
       return;
     }
 
-    String pump1Token = payload.substring(0, sep);
-    String pump2Token = payload.substring(sep + 1);
-
-    float pump1Cl = 0;
-    float pump2Cl = 0;
-    if (!parseNonNegativeFloat(pump1Token, &pump1Cl) || !parseNonNegativeFloat(pump2Token, &pump2Cl))
+    bool anyPositive = false;
+    for (int i = 0; i < count; i++)
+    {
+      if (vols[i] > 0)
+      {
+        anyPositive = true;
+      }
+    }
+    if (!anyPositive)
     {
       Serial.println("ERROR:INVALID_VOLUME");
       return;
     }
 
-    if (pump1Cl <= 0 && pump2Cl <= 0)
-    {
-      Serial.println("ERROR:INVALID_VOLUME");
-      return;
-    }
-
-    startDispense(pump1Cl, pump2Cl);
+    startDispense(vols, count);
   }
   else if (cmd.startsWith("CAL:"))
   {
@@ -417,7 +472,8 @@ void handleCommand(String cmd)
 
     int pumpIndex = pumpToken.toInt();
     float quantityCl = 0.0;
-    if ((pumpIndex != 1 && pumpIndex != 2) || !parseNonNegativeFloat(quantityToken, &quantityCl) || quantityCl <= 0.0)
+    if (pumpIndex < 1 || pumpIndex > MAX_PUMPS
+        || !parseNonNegativeFloat(quantityToken, &quantityCl) || quantityCl <= 0.0)
     {
       Serial.println("ERROR:INVALID_CALIBRATION");
       return;
@@ -428,31 +484,27 @@ void handleCommand(String cmd)
   else if (cmd.startsWith("SETFLOW:"))
   {
     String payload = cmd.substring(8);
-    int sep = payload.indexOf(':');
-    if (sep < 0 || payload.indexOf(':', sep + 1) >= 0)
+    float vals[MAX_PUMPS];
+    int count = splitFloats(payload, vals, MAX_PUMPS, true);
+    if (count < 1)
     {
       Serial.println("ERROR:INVALID_CONSTANTS");
       return;
     }
 
-    String p1Token = payload.substring(0, sep);
-    String p2Token = payload.substring(sep + 1);
-    float newP1 = 0.0;
-    float newP2 = 0.0;
-    if (!parseNonNegativeFloat(p1Token, &newP1) || !parseNonNegativeFloat(p2Token, &newP2)
-        || newP1 <= 0.0 || newP2 <= 0.0)
+    pulsesPerCl = vals[0];
+    for (int i = 1; i < count; i++)
     {
-      Serial.println("ERROR:INVALID_CONSTANTS");
-      return;
+      timeFlowClPerSec[i] = vals[i];
     }
 
-    pulsesPerCl = newP1;
-    pump2FlowClPerSec = newP2;
-
-    Serial.print("SETFLOW:OK:");
-    Serial.print(pulsesPerCl, 3);
-    Serial.print(":");
-    Serial.println(pump2FlowClPerSec, 3);
+    Serial.print("SETFLOW:OK");
+    for (int i = 0; i < count; i++)
+    {
+      Serial.print(":");
+      Serial.print(vals[i], 3);
+    }
+    Serial.println();
   }
   else if (cmd == "STOP")
   {
@@ -478,57 +530,73 @@ void handleCommand(String cmd)
   }
 }
 
-void startDispense(float pump1Centiliters, float pump2Centiliters)
+void startDispense(float* volumesCentiliters, int count)
 {
   runMode = RUN_MODE_DISPENSE;
-  requestedPump1Cl = pump1Centiliters;
-  requestedPump2Cl = pump2Centiliters;
+  activePumpCount = count;
 
   noInterrupts();
   pulseCount = 0;
   interrupts();
 
-  targetPulses = (unsigned long)(pump1Centiliters * pulsesPerCl);
   dispenseStartTime = millis();
-  pump2StartTime = dispenseStartTime;
-  pump2TargetDurationMs = (unsigned long)((pump2Centiliters / pump2FlowClPerSec) * 1000.0);
   lastProgressReport = dispenseStartTime;
+  maxDispenseTime = 0;
 
-  if (pump1Centiliters > 0)
+  for (int i = 0; i < count; i++)
   {
-    float liters = pump1Centiliters / 100.0;
-    maxDispenseTime = (unsigned long)((liters / expectedMinFlow_Lmin) * 60000.0 * 1.5);
-    digitalWrite(pump1Pin, HIGH);
-    pump1Running = true;
-    pump1Done = false;
-  }
-  else
-  {
-    maxDispenseTime = 0;
-    digitalWrite(pump1Pin, LOW);
-    pump1Running = false;
-    pump1Done = true;
-  }
+    requestedCl[i] = volumesCentiliters[i];
+    pumpStartTime[i] = dispenseStartTime;
+    pumpTargetDurationMs[i] = 0;
 
-  if (pump2Centiliters > 0)
-  {
-    digitalWrite(pump2Pin, HIGH);
-    pump2Running = true;
-    pump2Done = false;
-  }
-  else
-  {
-    digitalWrite(pump2Pin, LOW);
-    pump2Running = false;
-    pump2Done = true;
+    if (i == 0)
+    {
+      // Pump 1: flow-meter controlled.
+      targetPulses = (unsigned long)(volumesCentiliters[0] * pulsesPerCl);
+      if (volumesCentiliters[0] > 0)
+      {
+        float liters = volumesCentiliters[0] / 100.0;
+        maxDispenseTime = (unsigned long)((liters / expectedMinFlow_Lmin) * 60000.0 * 1.5);
+        digitalWrite(pumpPins[0], HIGH);
+        pumpRunning[0] = true;
+        pumpDone[0] = false;
+      }
+      else
+      {
+        digitalWrite(pumpPins[0], LOW);
+        pumpRunning[0] = false;
+        pumpDone[0] = true;
+      }
+    }
+    else
+    {
+      // Pumps 2..N: time-based.
+      float flow = timeFlowClPerSec[i];
+      if (volumesCentiliters[i] > 0 && flow > 0.0001)
+      {
+        pumpTargetDurationMs[i] = (unsigned long)((volumesCentiliters[i] / flow) * 1000.0);
+        digitalWrite(pumpPins[i], HIGH);
+        pumpRunning[i] = true;
+        pumpDone[i] = false;
+      }
+      else
+      {
+        digitalWrite(pumpPins[i], LOW);
+        pumpRunning[i] = false;
+        pumpDone[i] = true;
+      }
+    }
   }
 
   dispensing = true;
 
-  Serial.print("STARTED:");
-  Serial.print(pump1Centiliters, 3);
-  Serial.print(":");
-  Serial.println(pump2Centiliters, 3);
+  Serial.print("STARTED");
+  for (int i = 0; i < count; i++)
+  {
+    Serial.print(":");
+    Serial.print(volumesCentiliters[i], 3);
+  }
+  Serial.println();
 }
 
 void startCalibration(int pumpIndex, float targetCentiliters)
@@ -539,32 +607,24 @@ void startCalibration(int pumpIndex, float targetCentiliters)
   calibrationTargetCl = targetCentiliters;
   calibrationStartTime = millis();
   lastProgressReport = calibrationStartTime;
-
-  requestedPump1Cl = 0.0;
-  requestedPump2Cl = 0.0;
+  activePumpCount = 0;
 
   noInterrupts();
   pulseCount = 0;
   interrupts();
 
-  digitalWrite(pump1Pin, LOW);
-  digitalWrite(pump2Pin, LOW);
-  pump1Running = false;
-  pump2Running = false;
-  pump1Done = false;
-  pump2Done = false;
+  for (int i = 0; i < MAX_PUMPS; i++)
+  {
+    digitalWrite(pumpPins[i], LOW);
+    pumpRunning[i] = false;
+    pumpDone[i] = false;
+    requestedCl[i] = 0.0;
+  }
 
-  if (pumpIndex == 1)
-  {
-    digitalWrite(pump1Pin, HIGH);
-    pump1Running = true;
-  }
-  else
-  {
-    digitalWrite(pump2Pin, HIGH);
-    pump2Running = true;
-    pump2StartTime = calibrationStartTime;
-  }
+  int idx = pumpIndex - 1;
+  digitalWrite(pumpPins[idx], HIGH);
+  pumpRunning[idx] = true;
+  pumpStartTime[idx] = calibrationStartTime;
 
   Serial.print("CAL:STARTED:");
   Serial.print(pumpIndex);
@@ -575,84 +635,79 @@ void startCalibration(int pumpIndex, float targetCentiliters)
 void stopDispense(const char* resultMsg)
 {
   unsigned long nowMs = millis();
-  digitalWrite(pump1Pin, LOW);
-  digitalWrite(pump2Pin, LOW);
+  for (int i = 0; i < MAX_PUMPS; i++)
+  {
+    digitalWrite(pumpPins[i], LOW);
+    pumpRunning[i] = false;
+    pumpDone[i] = true;
+  }
   dispensing = false;
   runMode = RUN_MODE_IDLE;
-  pump1Running = false;
-  pump2Running = false;
-  pump1Done = true;
-  pump2Done = true;
 
   noInterrupts();
   unsigned long currentPulses = pulseCount;
   interrupts();
 
-  float actualPump1Cl = getPump1MeasuredCl(currentPulses);
-  float estimatedPump2Cl = getPump2EstimatedCl(nowMs);
+  int n = activePumpCount > 0 ? activePumpCount : 1;
 
   Serial.print(resultMsg);
-  Serial.print(":");
-  Serial.print(actualPump1Cl, 3);
-  Serial.print(":");
-  Serial.println(estimatedPump2Cl, 3);
+  for (int i = 0; i < n; i++)
+  {
+    Serial.print(":");
+    float value = (i == 0) ? getPump1MeasuredCl(currentPulses)
+                           : getPumpTimeEstimateCl(i, nowMs);
+    Serial.print(value, 3);
+  }
+  Serial.println();
+
+  activePumpCount = 0;
 }
 
 void stopCalibration(const char* resultMsg, bool applyCalibration)
 {
   unsigned long nowMs = millis();
-  digitalWrite(pump1Pin, LOW);
-  digitalWrite(pump2Pin, LOW);
+  for (int i = 0; i < MAX_PUMPS; i++)
+  {
+    digitalWrite(pumpPins[i], LOW);
+    pumpRunning[i] = false;
+    pumpDone[i] = true;
+  }
 
   dispensing = false;
   runMode = RUN_MODE_IDLE;
-  pump1Running = false;
-  pump2Running = false;
-  pump1Done = true;
-  pump2Done = true;
 
   noInterrupts();
   unsigned long currentPulses = pulseCount;
   interrupts();
 
-  unsigned long elapsedMs = nowMs - calibrationStartTime;
-  float elapsedSec = elapsedMs / 1000.0;
+  int idx = calibrationPumpIndex - 1;
+  float elapsedSec = (nowMs - calibrationStartTime) / 1000.0;
+  float newConstant;
 
-  float newPump1 = pulsesPerCl;
-  float newPump2 = pump2FlowClPerSec;
-
-  if (applyCalibration)
+  if (calibrationPumpIndex == 1)
   {
-    if (calibrationPumpIndex == 1)
+    newConstant = pulsesPerCl;
+    if (applyCalibration && calibrationTargetCl > 0.0 && currentPulses > 0)
     {
-      if (calibrationTargetCl > 0.0 && currentPulses > 0)
-      {
-        newPump1 = currentPulses / calibrationTargetCl;
-      }
+      newConstant = currentPulses / calibrationTargetCl;
+      pulsesPerCl = newConstant;
     }
-    else if (calibrationPumpIndex == 2)
+  }
+  else
+  {
+    newConstant = timeFlowClPerSec[idx];
+    if (applyCalibration && calibrationTargetCl > 0.0 && elapsedSec > 0.05)
     {
-      if (calibrationTargetCl > 0.0 && elapsedSec > 0.05)
-      {
-        newPump2 = calibrationTargetCl / elapsedSec;
-      }
-    }
-
-    if (newPump1 > 0.0)
-    {
-      pulsesPerCl = newPump1;
-    }
-    if (newPump2 > 0.0)
-    {
-      pump2FlowClPerSec = newPump2;
+      newConstant = calibrationTargetCl / elapsedSec;
+      timeFlowClPerSec[idx] = newConstant;
     }
   }
 
   Serial.print(resultMsg);
   Serial.print(":");
-  Serial.print(pulsesPerCl, 3);
+  Serial.print(calibrationPumpIndex);
   Serial.print(":");
-  Serial.println(pump2FlowClPerSec, 3);
+  Serial.println(newConstant, 3);
 
   calibrationPumpIndex = 0;
   calibrationTargetCl = 0.0;
@@ -673,13 +728,13 @@ void processDispenseTick()
   unsigned long currentPulses = pulseCount;
   interrupts();
 
-  if (pump1Running)
+  if (pumpRunning[0])
   {
     if (currentPulses >= targetPulses)
     {
-      digitalWrite(pump1Pin, LOW);
-      pump1Running = false;
-      pump1Done = true;
+      digitalWrite(pumpPins[0], LOW);
+      pumpRunning[0] = false;
+      pumpDone[0] = true;
     }
     else if (nowMs - dispenseStartTime > maxDispenseTime)
     {
@@ -688,14 +743,26 @@ void processDispenseTick()
     }
   }
 
-  if (pump2Running && (nowMs - pump2StartTime >= pump2TargetDurationMs))
+  for (int i = 1; i < activePumpCount; i++)
   {
-    digitalWrite(pump2Pin, LOW);
-    pump2Running = false;
-    pump2Done = true;
+    if (pumpRunning[i] && (nowMs - pumpStartTime[i] >= pumpTargetDurationMs[i]))
+    {
+      digitalWrite(pumpPins[i], LOW);
+      pumpRunning[i] = false;
+      pumpDone[i] = true;
+    }
   }
 
-  if (pump1Done && pump2Done)
+  bool allDone = true;
+  for (int i = 0; i < activePumpCount; i++)
+  {
+    if (!pumpDone[i])
+    {
+      allDone = false;
+    }
+  }
+
+  if (allDone)
   {
     stopDispense("OK");
   }
@@ -723,7 +790,17 @@ void processCalibrationTick()
   if (nowMs - lastProgressReport >= 250)
   {
     lastProgressReport = nowMs;
-    printProgress(currentPulses, nowMs);
+    float value;
+    if (calibrationPumpIndex == 1)
+    {
+      value = getPump1MeasuredCl(currentPulses);
+    }
+    else
+    {
+      value = ((nowMs - calibrationStartTime) / 1000.0) * timeFlowClPerSec[calibrationPumpIndex - 1];
+    }
+    Serial.print("PROGRESS:");
+    Serial.println(value, 3);
   }
 }
 

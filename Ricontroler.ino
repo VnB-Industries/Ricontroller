@@ -75,8 +75,9 @@ const float expectedMinFlow_Lmin = 0.2; // Used only to size the safety timeout;
 String inputBuffer = "";
 
 // RFID debounce state
-static char        s_lastUidHex[32]  = "";
-static unsigned long s_lastUidSentMs = 0;
+static char          s_activeUidHex[32]    = "";
+static unsigned long s_activeUidLastSeenMs = 0;
+const unsigned long  rfidRemovalTimeoutMs  = 1500UL;
 
 static bool nfcReady = false;
 static unsigned long s_lastNfcInitAttemptMs = 0;
@@ -732,6 +733,8 @@ void processCalibrationTick()
 // does not interfere with pump control.
 void pollRfid()
 {
+  unsigned long nowMs = millis();
+
   if (!nfcReady)
   {
     // Keep trying to recover PN532 after transient power/reset issues.
@@ -743,7 +746,15 @@ void pollRfid()
   uint8_t uidLen = 0;
 
   if (!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50))
+  {
+    // Consider the tag removed only after a grace period to tolerate brief read misses.
+    if (s_activeUidHex[0] != '\0' && (nowMs - s_activeUidLastSeenMs) > rfidRemovalTimeoutMs)
+    {
+      s_activeUidHex[0] = '\0';
+      s_activeUidLastSeenMs = 0;
+    }
     return;
+  }
   if (uidLen == 0) return;
 
   // Format UID bytes as uppercase hex
@@ -754,13 +765,17 @@ void pollRfid()
     strcat(uidHex, tmp);
   }
 
-  unsigned long nowMs = millis();
-  // Debounce: ignore same tag presented within 3 s
-  if (strcmp(uidHex, s_lastUidHex) == 0 && nowMs - s_lastUidSentMs < 3000UL)
+  // Same tag is still present: refresh presence timestamp and do not re-emit.
+  if (strcmp(uidHex, s_activeUidHex) == 0)
+  {
+    s_activeUidLastSeenMs = nowMs;
     return;
+  }
 
-  strncpy(s_lastUidHex, uidHex, sizeof(s_lastUidHex) - 1);
-  s_lastUidSentMs = nowMs;
+  // New tag (or previous one removed): emit once and mark as active.
+  strncpy(s_activeUidHex, uidHex, sizeof(s_activeUidHex) - 1);
+  s_activeUidHex[sizeof(s_activeUidHex) - 1] = '\0';
+  s_activeUidLastSeenMs = nowMs;
 
   Serial.print("RFID:");
   Serial.println(uidHex);

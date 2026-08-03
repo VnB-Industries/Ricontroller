@@ -1,11 +1,11 @@
 // Arduino flow-controlled dispenser
 // Receives commands over USB serial from Raspberry Pi (or serial console for debug)
-// Command format: DISPENSE:<pump1_cL>:<pump2_cL>[:<pump3_cL>...] e.g. "DISPENSE:2:20"
+// DISPENSE format: DISPENSE:<p1_cL>:<p1_pulses_per_cL>:<p2_cL>:<p2_cL_per_s>[...]
+//   Fields alternate volume/flow-constant per pump. Controller computes targets.
 //   Pump 1 (index 0) has a flow meter; pumps 2..N are time-based.
 // Also supports:
 //   STOP                           (aborts an in-progress dispense/calibration)
 //   CAL:<pump_index>:<quantity_cL> (calibrate pump 1..N; pump 1 uses pulses, others time)
-//   SETFLOW:<p1_pulses_per_cL>:<p2_cL_per_s>[:<p3_cL_per_s>...] (set runtime constants)
 //
 // RFID: Grove NFC shield (PN532, SPI default wiring). Install "Adafruit PN532"
 //       from Arduino Library Manager. CS/SS on D10 by default.
@@ -99,7 +99,7 @@ void captureResetFlags(void)
 
 void readSerialCommands();
 void handleCommand(String cmd);
-void startDispense(float* volumesCentiliters, int count);
+void startDispense(float* volumes, float* flows, int count);
 void stopDispense(const char* resultMsg);
 void startCalibration(int pumpIndex, float targetCentiliters);
 void stopCalibration(const char* resultMsg, bool applyCalibration);
@@ -421,19 +421,31 @@ void handleCommand(String cmd)
     }
 
     String payload = cmd.substring(9);
-    float vols[MAX_PUMPS];
-    int count = splitFloats(payload, vols, MAX_PUMPS, false);
-    if (count < 1)
+    // Format: <cl>:<flow_const>:<cl>:<flow_const>... (2 fields per pump)
+    float all_params[MAX_PUMPS * 2];
+    int field_count = splitFloats(payload, all_params, MAX_PUMPS * 2, false);
+    if (field_count < 2 || (field_count % 2) != 0)
     {
       Serial.println("ERROR:INVALID_VOLUME");
       return;
     }
 
+    int pump_count = field_count / 2;
+    float vols[MAX_PUMPS];
+    float flows[MAX_PUMPS];
     bool anyPositive = false;
-    for (int i = 0; i < count; i++)
+
+    for (int i = 0; i < pump_count; i++)
     {
+      vols[i]  = all_params[2 * i];
+      flows[i] = all_params[2 * i + 1];
       if (vols[i] > 0)
       {
+        if (flows[i] <= 0)
+        {
+          Serial.println("ERROR:INVALID_VOLUME");
+          return;
+        }
         anyPositive = true;
       }
     }
@@ -443,7 +455,7 @@ void handleCommand(String cmd)
       return;
     }
 
-    startDispense(vols, count);
+    startDispense(vols, flows, pump_count);
   }
   else if (cmd.startsWith("CAL:"))
   {
@@ -482,31 +494,6 @@ void handleCommand(String cmd)
 
     startCalibration(pumpIndex, quantityCl);
   }
-  else if (cmd.startsWith("SETFLOW:"))
-  {
-    String payload = cmd.substring(8);
-    float vals[MAX_PUMPS];
-    int count = splitFloats(payload, vals, MAX_PUMPS, true);
-    if (count < 1)
-    {
-      Serial.println("ERROR:INVALID_CONSTANTS");
-      return;
-    }
-
-    pulsesPerCl = vals[0];
-    for (int i = 1; i < count; i++)
-    {
-      timeFlowClPerSec[i] = vals[i];
-    }
-
-    Serial.print("SETFLOW:OK");
-    for (int i = 0; i < count; i++)
-    {
-      Serial.print(":");
-      Serial.print(vals[i], 3);
-    }
-    Serial.println();
-  }
   else if (cmd == "STOP")
   {
     if (dispensing)
@@ -531,8 +518,13 @@ void handleCommand(String cmd)
   }
 }
 
-void startDispense(float* volumesCentiliters, int count)
+void startDispense(float* volumes, float* flows, int count)
 {
+  // Refresh stored constants so calibration progress uses up-to-date values.
+  pulsesPerCl = flows[0];
+  for (int i = 1; i < count; i++)
+    timeFlowClPerSec[i] = flows[i];
+
   runMode = RUN_MODE_DISPENSE;
   activePumpCount = count;
 
@@ -546,17 +538,17 @@ void startDispense(float* volumesCentiliters, int count)
 
   for (int i = 0; i < count; i++)
   {
-    requestedCl[i] = volumesCentiliters[i];
+    requestedCl[i] = volumes[i];
     pumpStartTime[i] = dispenseStartTime;
     pumpTargetDurationMs[i] = 0;
 
     if (i == 0)
     {
       // Pump 1: flow-meter controlled.
-      targetPulses = (unsigned long)(volumesCentiliters[0] * pulsesPerCl);
-      if (volumesCentiliters[0] > 0)
+      targetPulses = (unsigned long)(volumes[0] * pulsesPerCl);
+      if (volumes[0] > 0)
       {
-        float liters = volumesCentiliters[0] / 100.0;
+        float liters = volumes[0] / 100.0;
         maxDispenseTime = (unsigned long)((liters / expectedMinFlow_Lmin) * 60000.0 * 1.5);
         digitalWrite(pumpPins[0], HIGH);
         pumpRunning[0] = true;
@@ -573,9 +565,9 @@ void startDispense(float* volumesCentiliters, int count)
     {
       // Pumps 2..N: time-based.
       float flow = timeFlowClPerSec[i];
-      if (volumesCentiliters[i] > 0 && flow > 0.0001)
+      if (volumes[i] > 0 && flow > 0.0001)
       {
-        pumpTargetDurationMs[i] = (unsigned long)((volumesCentiliters[i] / flow) * 1000.0);
+        pumpTargetDurationMs[i] = (unsigned long)((volumes[i] / flow) * 1000.0);
         digitalWrite(pumpPins[i], HIGH);
         pumpRunning[i] = true;
         pumpDone[i] = false;
@@ -595,7 +587,7 @@ void startDispense(float* volumesCentiliters, int count)
   for (int i = 0; i < count; i++)
   {
     Serial.print(":");
-    Serial.print(volumesCentiliters[i], 3);
+    Serial.print(volumes[i], 3);
   }
   Serial.println();
 }

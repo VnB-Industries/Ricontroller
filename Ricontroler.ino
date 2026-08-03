@@ -77,7 +77,7 @@ String inputBuffer = "";
 // RFID debounce state
 static char          s_activeUidHex[32]    = "";
 static unsigned long s_activeUidLastSeenMs = 0;
-const unsigned long  rfidRemovalTimeoutMs  = 1500UL;
+const unsigned long  rfidRemovalTimeoutMs  = 5000UL;
 
 static bool nfcReady = false;
 static unsigned long s_lastNfcInitAttemptMs = 0;
@@ -742,7 +742,7 @@ void pollRfid()
     return;
   }
 
-  uint8_t uid[7];
+  uint8_t uid[7]= {0};
   uint8_t uidLen = 0;
 
   if (!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50))

@@ -74,6 +74,8 @@ unsigned long calibrationStartTime = 0;
 const float expectedMinFlow_Lmin = 0.2; // Used only to size the safety timeout;
                                          // set below your pump's slowest expected flow
 
+const unsigned long pumpStartStaggerMs = 120; // Gap between relay activations to avoid a combined inrush-current brownout
+
 String inputBuffer = "";
 
 // RFID debounce state
@@ -426,7 +428,9 @@ void handleCommand(String cmd)
     int field_count = splitFloats(payload, all_params, MAX_PUMPS * 2, false);
     if (field_count < 2 || (field_count % 2) != 0)
     {
-      Serial.println("ERROR:INVALID_VOLUME");
+      // Echo the raw payload so the field that failed to parse is visible on the PC side.
+      Serial.print("ERROR:INVALID_VOLUME:FIELDS:");
+      Serial.println(payload);
       return;
     }
 
@@ -443,7 +447,10 @@ void handleCommand(String cmd)
       {
         if (flows[i] <= 0)
         {
-          Serial.println("ERROR:INVALID_VOLUME");
+          Serial.print("ERROR:INVALID_VOLUME:FLOW");
+          Serial.print(i);
+          Serial.print(":");
+          Serial.println(payload);
           return;
         }
         anyPositive = true;
@@ -451,7 +458,8 @@ void handleCommand(String cmd)
     }
     if (!anyPositive)
     {
-      Serial.println("ERROR:INVALID_VOLUME");
+      Serial.print("ERROR:INVALID_VOLUME:ALLZERO:");
+      Serial.println(payload);
       return;
     }
 
@@ -536,6 +544,8 @@ void startDispense(float* volumes, float* flows, int count)
   lastProgressReport = dispenseStartTime;
   maxDispenseTime = 0;
 
+  bool anyPumpStarted = false;
+
   for (int i = 0; i < count; i++)
   {
     requestedCl[i] = volumes[i];
@@ -550,9 +560,11 @@ void startDispense(float* volumes, float* flows, int count)
       {
         float liters = volumes[0] / 100.0;
         maxDispenseTime = (unsigned long)((liters / expectedMinFlow_Lmin) * 60000.0 * 1.5);
+        pumpStartTime[0] = millis();
         digitalWrite(pumpPins[0], HIGH);
         pumpRunning[0] = true;
         pumpDone[0] = false;
+        anyPumpStarted = true;
       }
       else
       {
@@ -567,10 +579,13 @@ void startDispense(float* volumes, float* flows, int count)
       float flow = timeFlowClPerSec[i];
       if (volumes[i] > 0 && flow > 0.0001)
       {
+        if (anyPumpStarted) delay(pumpStartStaggerMs);
         pumpTargetDurationMs[i] = (unsigned long)((volumes[i] / flow) * 1000.0);
+        pumpStartTime[i] = millis();
         digitalWrite(pumpPins[i], HIGH);
         pumpRunning[i] = true;
         pumpDone[i] = false;
+        anyPumpStarted = true;
       }
       else
       {

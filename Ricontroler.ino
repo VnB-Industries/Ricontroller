@@ -8,6 +8,7 @@
 //   @<seq>:DISPENSE:<p1_cL>:<p1_pulses_per_cL>:<p2_cL>:<p2_cL_per_s>[...]
 //       Fields alternate volume/flow-constant per pump. Controller computes targets.
 //       Pump 1 (index 0) has a flow meter; pumps 2..N are time-based.
+//       Pumps run one at a time, in index order.
 //   @<seq>:CAL:<pump_index>:<quantity_cL>
 //       Calibrate pump 1..N; pump 1 uses pulses, others time.
 //   @<seq>:PURGE:<pump_index|0=all>:<duration_ms>
@@ -112,6 +113,12 @@ const float expectedMinFlow_Lmin = 0.2; // Used only to size the safety timeout;
 
 const unsigned long pumpStartStaggerMs = 120; // Gap between relay activations to avoid a combined inrush-current brownout
 
+// Dispense runs one pump at a time: with two motors on together the switching
+// noise knocked the board off USB. The next pump starts this long after the
+// previous one stopped, so the supply settles in between.
+const unsigned long pumpSequenceGapMs = 300;
+unsigned long nextSequentialStartMs = 0;
+
 // Fixed-size command buffer. A String grew without bound here, so a noise
 // burst with no newline could exhaust the 2 kB of SRAM mid-dispense.
 #define CMD_BUF_LEN 160
@@ -158,6 +165,8 @@ void replyError(unsigned int seq, const char* code);
 void runWatchdogEnable();
 void runWatchdogDisable();
 void serviceStaggeredStarts(unsigned long nowMs);
+void serviceSequentialStarts(unsigned long nowMs);
+void stopSequentialPump(int idx, unsigned long nowMs);
 
 void rpm()
 {
@@ -370,7 +379,7 @@ float getPumpTimeEstimateCl(int idx, unsigned long nowMs)
   }
 
   float flow = timeFlowClPerSec[idx];
-  if (requestedCl[idx] <= 0 || flow <= 0.0001)
+  if (requestedCl[idx] <= 0 || flow <= 0.0001 || pumpPendingStart[idx])
   {
     return 0.0;
   }
@@ -696,6 +705,36 @@ void serviceStaggeredStarts(unsigned long nowMs)
   }
 }
 
+// Dispense: start the next waiting pump, lowest index first, once no pump is
+// running and the gap after the previous one has elapsed.
+void serviceSequentialStarts(unsigned long nowMs)
+{
+  for (int i = 0; i < MAX_PUMPS; i++)
+    if (pumpRunning[i]) return;
+
+  if ((long)(nowMs - nextSequentialStartMs) < 0) return;
+
+  for (int i = 0; i < MAX_PUMPS; i++)
+  {
+    if (!pumpPendingStart[i]) continue;
+
+    pumpPendingStart[i] = false;
+    pumpStartTime[i] = nowMs;
+    digitalWrite(pumpPins[i], HIGH);
+    pumpRunning[i] = true;
+    pumpDone[i] = false;
+    return;
+  }
+}
+
+void stopSequentialPump(int idx, unsigned long nowMs)
+{
+  digitalWrite(pumpPins[idx], LOW);
+  pumpRunning[idx] = false;
+  pumpDone[idx] = true;
+  nextSequentialStartMs = nowMs + pumpSequenceGapMs;
+}
+
 void startDispense(unsigned int seq, float* volumes, float* flows, int count)
 {
   // Refresh stored constants so calibration progress uses up-to-date values.
@@ -715,8 +754,6 @@ void startDispense(unsigned int seq, float* volumes, float* flows, int count)
   dispenseStartTime = nowMs;
   lastProgressReport = nowMs;
   maxDispenseTime = 0;
-
-  int staggerSlot = 0;
 
   for (int i = 0; i < MAX_PUMPS; i++)
   {
@@ -743,12 +780,10 @@ void startDispense(unsigned int seq, float* volumes, float* flows, int count)
       {
         float liters = volumes[0] / 100.0;
         maxDispenseTime = (unsigned long)((liters / expectedMinFlow_Lmin) * 60000.0 * 1.5);
-        // First pump starts immediately; the rest are spread out below.
-        pumpStartTime[0] = nowMs;
-        digitalWrite(pumpPins[0], HIGH);
-        pumpRunning[0] = true;
+        // Queued first, so it starts immediately below.
+        pumpPendingStart[0] = true;
+        pumpRunning[0] = false;
         pumpDone[0] = false;
-        staggerSlot = 1;
       }
       else
       {
@@ -764,14 +799,11 @@ void startDispense(unsigned int seq, float* volumes, float* flows, int count)
       if (volumes[i] > 0 && flow > 0.0001)
       {
         pumpTargetDurationMs[i] = (unsigned long)((volumes[i] / flow) * 1000.0);
-        // Deferred start, serviced from the tick: no delay() here, so STOP
-        // stays reachable while the earlier pumps are already running.
+        // Queued: started from the tick once the pump before it has stopped.
+        // No delay() here, so STOP stays reachable throughout.
         pumpPendingStart[i] = true;
-        pumpStartAtMs[i] = nowMs + (unsigned long)staggerSlot * pumpStartStaggerMs;
-        pumpStartTime[i] = pumpStartAtMs[i];
         pumpRunning[i] = false;
         pumpDone[i] = false;
-        staggerSlot++;
       }
       else
       {
@@ -782,12 +814,10 @@ void startDispense(unsigned int seq, float* volumes, float* flows, int count)
     }
   }
 
-  // The flow-meter timeout is measured from the first start; the staggered
-  // pumps finish on their own durations, so give the window the stagger back.
-  if (maxDispenseTime > 0)
-  {
-    maxDispenseTime += (unsigned long)staggerSlot * pumpStartStaggerMs;
-  }
+  // Pump 1 runs first, so its timeout window starts with the run. The time
+  // pumps after it finish on their own durations.
+  nextSequentialStartMs = nowMs;
+  serviceSequentialStarts(nowMs);
 
   dispensing = true;
   runWatchdogEnable();
@@ -1055,7 +1085,10 @@ void processDispenseTick()
     return;
   }
 
-  serviceStaggeredStarts(nowMs);
+  if (runMode == RUN_MODE_PURGE)
+    serviceStaggeredStarts(nowMs);
+  else
+    serviceSequentialStarts(nowMs);
 
   noInterrupts();
   unsigned long currentPulses = pulseCount;
@@ -1100,9 +1133,7 @@ void processDispenseTick()
   {
     if (currentPulses >= targetPulses)
     {
-      digitalWrite(pumpPins[0], LOW);
-      pumpRunning[0] = false;
-      pumpDone[0] = true;
+      stopSequentialPump(0, nowMs);
     }
     else if (nowMs - dispenseStartTime > maxDispenseTime)
     {
@@ -1115,9 +1146,7 @@ void processDispenseTick()
   {
     if (pumpRunning[i] && (nowMs - pumpStartTime[i] >= pumpTargetDurationMs[i]))
     {
-      digitalWrite(pumpPins[i], LOW);
-      pumpRunning[i] = false;
-      pumpDone[i] = true;
+      stopSequentialPump(i, nowMs);
     }
   }
 

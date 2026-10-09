@@ -25,6 +25,11 @@
 //           @<seq>:CAL_DONE:<pump>:<constant>:<by_sensor 0|1>
 // Telemetry (never sequenced): PROGRESS:<cL>...  RFID:<uid>  READY
 //                              NFC:<state>  RESET_CAUSE:<cause>:0x<raw>
+//                              NOISE:<accepted>:<rejected>:<after_pump1_stop>
+//       NOISE follows the final reply of a dispense, purge or calibration:
+//       flow-meter edges counted, edges dropped by the glitch filter, and
+//       edges counted after pump 1 stopped (noise that got through, or
+//       liquid still moving through the meter).
 //
 // RFID: Grove NFC shield (PN532, SPI default wiring). Install "Adafruit PN532"
 //       from Arduino Library Manager. CS/SS on D10 by default.
@@ -56,6 +61,14 @@ const int pumpPins[MAX_PUMPS] = { 7, 6, 5, 8, 9, 3 };
 const bool irDetectActiveLow = true; // true for common LM393 modules: LOW means object detected
 
 volatile unsigned long pulseCount = 0;
+
+// Motor switching puts bursts of short spikes on the flow-meter line. An edge
+// closer than this to the last counted one is treated as one of those spikes.
+// 300 us still counts up to 3.3 kHz, well above the fastest real pulse rate
+// the pump 1 constant implies (~540 pulses/cL at ~3 cL/s, about 1.6 kHz).
+const unsigned long minPulseIntervalUs = 300;
+volatile unsigned long pulseRejected = 0;
+volatile unsigned long lastPulseUs = 0;
 
 const float defaultPulsesPerCl = 540.42;
 const float defaultPump2FlowClPerSec = 2.8;
@@ -136,6 +149,13 @@ const unsigned long noFlowTimeoutMs = 3000;
 unsigned long lastSeenPulses = 0;
 unsigned long lastPulseChangeMs = 0;
 
+// The flow interrupt stays attached for the whole run, so pulses keep arriving
+// while the timed pumps run after pump 1 (motor noise on the sensor line, or
+// liquid still moving through the meter). Pump 1's volume is frozen at the
+// count it stopped on, so those pulses are not reported as pump 1 liquid.
+bool          pump1Frozen = false;
+unsigned long pump1FrozenPulses = 0;
+
 // A timed pump stops on its own once its planned duration is up. One still
 // running this long past that means the sequencing has gone wrong, so the
 // whole pour is aborted rather than trusted to end by itself.
@@ -193,7 +213,40 @@ void stopSequentialPump(int idx, unsigned long nowMs);
 
 void rpm()
 {
+  unsigned long nowUs = micros();
+  if (pulseCount != 0 && (nowUs - lastPulseUs) < minPulseIntervalUs)
+  {
+    pulseRejected++;
+    return;
+  }
+  lastPulseUs = nowUs;
   pulseCount++;
+}
+
+void resetPulseCounters()
+{
+  noInterrupts();
+  pulseCount = 0;
+  pulseRejected = 0;
+  interrupts();
+  pump1Frozen = false;
+  pump1FrozenPulses = 0;
+}
+
+void printNoise()
+{
+  noInterrupts();
+  unsigned long accepted = pulseCount;
+  unsigned long rejected = pulseRejected;
+  interrupts();
+
+  Serial.print("NOISE:");
+  Serial.print(accepted);
+  Serial.print(":");
+  Serial.print(rejected);
+  Serial.print(":");
+  Serial.println(pump1Frozen && accepted > pump1FrozenPulses
+                   ? accepted - pump1FrozenPulses : 0UL);
 }
 
 bool isObjectDetected()
@@ -465,8 +518,9 @@ float getPurgeEstimateCl(int idx, unsigned long nowMs)
 float measuredForPump(int idx, unsigned long currentPulses, unsigned long nowMs)
 {
   if (runMode == RUN_MODE_PURGE) return getPurgeEstimateCl(idx, nowMs);
-  return (idx == 0) ? getPump1MeasuredCl(currentPulses)
-                    : getPumpTimeEstimateCl(idx, nowMs);
+  if (idx == 0)
+    return getPump1MeasuredCl(pump1Frozen ? pump1FrozenPulses : currentPulses);
+  return getPumpTimeEstimateCl(idx, nowMs);
 }
 
 void printProgress(unsigned long currentPulses, unsigned long nowMs)
@@ -775,6 +829,14 @@ void stopSequentialPump(int idx, unsigned long nowMs)
   pumpRunning[idx] = false;
   pumpDone[idx] = true;
   nextSequentialStartMs = nowMs + pumpSequenceGapMs;
+
+  if (idx == 0)
+  {
+    noInterrupts();
+    pump1FrozenPulses = pulseCount;
+    interrupts();
+    pump1Frozen = true;
+  }
 }
 
 void startDispense(unsigned int seq, float* volumes, float* flows, int count)
@@ -788,9 +850,7 @@ void startDispense(unsigned int seq, float* volumes, float* flows, int count)
   activePumpCount = count;
   activeSeq = seq;
 
-  noInterrupts();
-  pulseCount = 0;
-  interrupts();
+  resetPulseCounters();
 
   unsigned long nowMs = millis();
   dispenseStartTime = nowMs;
@@ -836,6 +896,8 @@ void startDispense(unsigned int seq, float* volumes, float* flows, int count)
         digitalWrite(pumpPins[0], LOW);
         pumpRunning[0] = false;
         pumpDone[0] = true;
+        // Pump 1 is not part of this pour: report 0, not stray pulses.
+        pump1Frozen = true;
       }
     }
     else
@@ -888,9 +950,7 @@ void startPurge(unsigned int seq, int pumpIndex, unsigned long durationMs)
   activeSeq = seq;
   purgeDurationMs = durationMs;
 
-  noInterrupts();
-  pulseCount = 0;
-  interrupts();
+  resetPulseCounters();
 
   unsigned long nowMs = millis();
   dispenseStartTime = nowMs;
@@ -987,6 +1047,7 @@ void stopDispense(const char* resultMsg, const char* errorCode)
     Serial.print(measuredForPump(i, currentPulses, nowMs), 3);
   }
   Serial.println();
+  printNoise();
 
   runMode = RUN_MODE_IDLE;
   activePumpCount = 0;
@@ -1027,9 +1088,7 @@ void startCalibration(unsigned int seq, int pumpIndex, float targetCentiliters)
   if (bound > calibrationCeilingMs) bound = calibrationCeilingMs;
   calibrationMaxMs = bound;
 
-  noInterrupts();
-  pulseCount = 0;
-  interrupts();
+  resetPulseCounters();
 
   for (int i = 0; i < MAX_PUMPS; i++)
   {
@@ -1124,6 +1183,7 @@ void stopCalibration(bool stoppedBySensor, bool applyCalibration, const char* er
     Serial.print(":");
     Serial.println(stoppedBySensor ? 1 : 0);
   }
+  printNoise();
 
   runMode = RUN_MODE_IDLE;
   calibrationPumpIndex = 0;

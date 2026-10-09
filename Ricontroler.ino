@@ -119,6 +119,28 @@ const unsigned long pumpStartStaggerMs = 120; // Gap between relay activations t
 const unsigned long pumpSequenceGapMs = 300;
 unsigned long nextSequentialStartMs = 0;
 
+// The IR module flickers with liquid and glass in front of it. A single "no
+// glass" reading used to abort a pour, and to end a calibration with a wrong
+// constant; the glass now has to stay gone this long. The moment it first went
+// missing is kept so a calibration is measured up to that point, not to the
+// end of the debounce window.
+const unsigned long objectLostDebounceMs = 200;
+bool          objectMissing = false;
+unsigned long objectMissingSinceMs = 0;
+unsigned long pulsesAtObjectMissing = 0;
+
+// Pump 1 has a flow meter: no pulse for this long while it runs means an empty
+// bottle or a blocked line, so stop rather than run dry until the volume
+// timeout (several minutes for a large pour).
+const unsigned long noFlowTimeoutMs = 3000;
+unsigned long lastSeenPulses = 0;
+unsigned long lastPulseChangeMs = 0;
+
+// A timed pump stops on its own once its planned duration is up. One still
+// running this long past that means the sequencing has gone wrong, so the
+// whole pour is aborted rather than trusted to end by itself.
+const unsigned long timedPumpOverrunMs = 10000UL;
+
 // Fixed-size command buffer. A String grew without bound here, so a noise
 // burst with no newline could exhaust the 2 kB of SRAM mid-dispense.
 #define CMD_BUF_LEN 160
@@ -158,6 +180,7 @@ void processCalibrationTick();
 void processDispenseTick();
 void pollRfid();
 bool isObjectDetected();
+bool objectLostDebounced(unsigned long nowMs, unsigned long currentPulses);
 void printResetCause();
 void tryInitNfc(bool force);
 void replyHeader(unsigned int seq);
@@ -177,6 +200,25 @@ bool isObjectDetected()
 {
   int raw = digitalRead(irSensorPin);
   return irDetectActiveLow ? (raw == LOW) : (raw == HIGH);
+}
+
+// True once the glass has been absent for objectLostDebounceMs in a row.
+bool objectLostDebounced(unsigned long nowMs, unsigned long currentPulses)
+{
+  if (isObjectDetected())
+  {
+    objectMissing = false;
+    return false;
+  }
+
+  if (!objectMissing)
+  {
+    objectMissing = true;
+    objectMissingSinceMs = nowMs;
+    pulsesAtObjectMissing = currentPulses;
+  }
+
+  return (nowMs - objectMissingSinceMs) >= objectLostDebounceMs;
 }
 
 // ── reply helpers ──────────────────────────────────────────────────────────
@@ -754,6 +796,10 @@ void startDispense(unsigned int seq, float* volumes, float* flows, int count)
   dispenseStartTime = nowMs;
   lastProgressReport = nowMs;
   maxDispenseTime = 0;
+  objectMissing = false;
+  // Pump 1 starts right away below, so its no-flow window starts now.
+  lastSeenPulses = 0;
+  lastPulseChangeMs = nowMs;
 
   for (int i = 0; i < MAX_PUMPS; i++)
   {
@@ -851,6 +897,7 @@ void startPurge(unsigned int seq, int pumpIndex, unsigned long durationMs)
   lastProgressReport = nowMs;
   maxDispenseTime = durationMs + 2000UL;   // hard ceiling for the whole run
   targetPulses = 0;                        // purge is time-driven, not metered
+  objectMissing = false;
 
   bool all = (pumpIndex == 0);
   int staggerSlot = 0;
@@ -957,6 +1004,7 @@ void startCalibration(unsigned int seq, int pumpIndex, float targetCentiliters)
   calibrationStartTime = millis();
   lastProgressReport = calibrationStartTime;
   activePumpCount = 0;
+  objectMissing = false;
 
   // Bound the run from the expected duration at the current constant, so a
   // sensor that never reports the glass leaving cannot pump indefinitely.
@@ -1026,8 +1074,18 @@ void stopCalibration(bool stoppedBySensor, bool applyCalibration, const char* er
   unsigned long currentPulses = pulseCount;
   interrupts();
 
+  // Ended by the glass leaving: measure up to the moment it first went
+  // missing. The pump ran on through the debounce window, but that liquid did
+  // not land in the glass.
+  unsigned long endMs = nowMs;
+  if (stoppedBySensor)
+  {
+    endMs = objectMissingSinceMs;
+    currentPulses = pulsesAtObjectMissing;
+  }
+
   int idx = calibrationPumpIndex - 1;
-  float elapsedSec = (nowMs - calibrationStartTime) / 1000.0;
+  float elapsedSec = (endMs - calibrationStartTime) / 1000.0;
   float newConstant;
 
   if (calibrationPumpIndex == 1)
@@ -1079,7 +1137,11 @@ void processDispenseTick()
 {
   unsigned long nowMs = millis();
 
-  if (!isObjectDetected())
+  noInterrupts();
+  unsigned long currentPulses = pulseCount;
+  interrupts();
+
+  if (objectLostDebounced(nowMs, currentPulses))
   {
     stopDispense(NULL, "NO_OBJECT");
     return;
@@ -1089,10 +1151,6 @@ void processDispenseTick()
     serviceStaggeredStarts(nowMs);
   else
     serviceSequentialStarts(nowMs);
-
-  noInterrupts();
-  unsigned long currentPulses = pulseCount;
-  interrupts();
 
   if (runMode == RUN_MODE_PURGE)
   {
@@ -1131,9 +1189,20 @@ void processDispenseTick()
 
   if (pumpRunning[0])
   {
+    if (currentPulses != lastSeenPulses)
+    {
+      lastSeenPulses = currentPulses;
+      lastPulseChangeMs = nowMs;
+    }
+
     if (currentPulses >= targetPulses)
     {
       stopSequentialPump(0, nowMs);
+    }
+    else if (nowMs - lastPulseChangeMs > noFlowTimeoutMs)
+    {
+      stopDispense(NULL, "NO_FLOW");
+      return;
     }
     else if (nowMs - dispenseStartTime > maxDispenseTime)
     {
@@ -1144,7 +1213,15 @@ void processDispenseTick()
 
   for (int i = 1; i < activePumpCount; i++)
   {
-    if (pumpRunning[i] && (nowMs - pumpStartTime[i] >= pumpTargetDurationMs[i]))
+    if (!pumpRunning[i]) continue;
+
+    unsigned long ranMs = nowMs - pumpStartTime[i];
+    if (ranMs >= pumpTargetDurationMs[i] + timedPumpOverrunMs)
+    {
+      stopDispense(NULL, "TIMEOUT");
+      return;
+    }
+    if (ranMs >= pumpTargetDurationMs[i])
     {
       stopSequentialPump(i, nowMs);
     }
@@ -1178,7 +1255,7 @@ void processCalibrationTick()
   unsigned long currentPulses = pulseCount;
   interrupts();
 
-  if (!isObjectDetected())
+  if (objectLostDebounced(nowMs, currentPulses))
   {
     // The glass leaving is the intended end of a calibration run.
     stopCalibration(true, true, NULL);
